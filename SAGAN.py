@@ -1,4 +1,5 @@
 import time
+import tensorflow as tf
 from ops import *
 from utils import *
 from tensorflow.contrib.data import prefetch_to_device, shuffle_and_repeat, map_and_batch
@@ -6,60 +7,49 @@ from glob import glob
 
 class SAGAN(object):
 
-    def __init__(self, sess, args):
-        self.model_name = "SAGAN"  # name for checkpoint
+    def __init__(self, sess, **kwargs):
         self.sess = sess
-        self.dataset_name = args.dataset
-        self.checkpoint_dir = args.checkpoint_dir
-        self.sample_dir = args.sample_dir
-        self.result_dir = args.result_dir
-        self.log_dir = args.log_dir
+        self.model_name = "SAGAN"  # name for checkpoint
+        self.dataset_name = kwargs.get('dataset')
+        self.checkpoint_dir = kwargs.get('checkpoint_dir')
+        self.sample_dir = kwargs.get('sample_dir')
+        self.result_dir = kwargs.get('result_dir')
+        self.log_dir = kwargs.get('log_dir')
 
-        self.epoch = args.epoch
-        self.iteration = args.iteration
-        self.batch_size = args.batch_size
-        self.print_freq = args.print_freq
-        self.save_freq = args.save_freq
-        self.img_size = args.img_size
+        self.epoch = kwargs.get('epoch', 10)
+        self.iteration = kwargs.get('iteration', 10000)
+        self.batch_size = kwargs.get('batch_size', 16)
+        self.print_freq = kwargs.get('print_freq', 500)
+        self.save_freq = kwargs.get('save_freq', 500)
+        self.img_size = kwargs.get('img_size', 128)
 
         """ Generator """
         self.layer_num = int(np.log2(self.img_size)) - 3
-        self.z_dim = args.z_dim  # dimension of noise-vector
-        self.gan_type = args.gan_type
+        self.z_dim = kwargs.get('z_dim', 128)  # dimension of noise-vector
+        self.gan_type = kwargs.get('gan_type', 'hinge')
 
         """ Discriminator """
-        self.n_critic = args.n_critic
-        self.sn = args.sn
-        self.ld = args.ld
+        self.n_critic = kwargs.get('n_critic', 1)
+        self.sn = kwargs.get('sn', True)
+        self.ld = kwargs.get('ld', 10.0)
 
 
-        self.sample_num = args.sample_num  # number of generated images to be saved
-        self.test_num = args.test_num
+        self.sample_num = kwargs.get('sample_num', 64)  # number of generated images to be saved
+        self.test_num = kwargs.get('test_num', 10)
 
         """ Augmentation """
-        self.crop_pos = args.crop_pos
+        self.crop_pos = kwargs.get('crop_pos', 'center')
 
 
         # train
-        self.g_learning_rate = args.g_lr
-        self.d_learning_rate = args.d_lr
-        self.beta1 = args.beta1
-        self.beta2 = args.beta2
+        self.g_learning_rate = kwargs.get('g_lr', 0.0001)
+        self.d_learning_rate = kwargs.get('d_lr', 0.0004)
+        self.beta1 = kwargs.get('beta1', 0.0)
+        self.beta2 = kwargs.get('beta2', 0.9)
 
-        self.custom_dataset = False
-
-        if self.dataset_name == 'mnist' :
-            self.c_dim = 1
-            self.data = load_mnist(size=self.img_size)
-
-        elif self.dataset_name == 'cifar10' :
-            self.c_dim = 3
-            self.data = load_cifar10(size=self.img_size)
-
-        else :
-            self.c_dim = 3
-            self.data = load_data(dataset_name=self.dataset_name, size=self.img_size)
-            self.custom_dataset = True
+        self.c_dim = 3
+        self.data = load_data(dataset_name=self.dataset_name, size=self.img_size)
+        self.custom_dataset = True
 
 
         self.dataset_num = len(self.data)
@@ -294,15 +284,41 @@ class SAGAN(object):
     # Train
     ##################################################################################
 
-    def train(self):
+    def train(self, z_noise=None):
+
         # initialize all variables
         tf.compat.v1.global_variables_initializer().run()
 
         # graph inputs for visualize training results
-        sample_num_rounded = int(np.ceil(self.sample_num/self.batch_size))
         self.sample_z = []
-        for i in range(sample_num_rounded):
-            self.sample_z.append(np.random.uniform(-1, 1, size=(self.batch_size, 1, 1, self.z_dim)))
+        if type(z_noise) is np.ndarray:
+            if z_noise.shape[3] != self.z_dim:          # mismatch of z_dim
+                print(f'dimension of z_noise mismatch : {self.z_dim}')
+                return
+            else:
+                self.sample_num = z_noise.shape[0]
+                if self.sample_num == self.batch_size:
+                    self.sample_z.append(z_noise)
+                elif self.sample_num < self.batch_size:
+                    z_padding = np.random.uniform(-1, 1, size=(self.batch_size-self.sample_num, 1, 1, self.z_dim))
+                    z_extended = np.concatenate([z_noise, z_padding])
+                    self.sample_z.append(z_extended)
+                elif self.sample_num > self.batch_size:
+                    full_batch_num = self.sample_num // self.batch_size
+                    remaining = self.batch_size % self.sample_num
+                    for batch_num in range(full_batch_num):
+                        z_noise_per_batch = z_noise[self.batch_size*batch_num:self.batch_size*(batch_num+1)]
+                        self.sample_z.append(z_noise_per_batch)
+                    if remaining > 0:
+                        z_padding = np.random.uniform(-1, 1, size=(self.batch_size-remaining, 1, 1, self.z_dim))
+                        z_remaining = z_noise[batch_num+1:]
+                        z_extended = np.concatenate([z_remaining, z_padding])
+                        self.sample_z.append(z_extended)
+
+        else:
+            sample_num_rounded = int(np.ceil(self.sample_num/self.batch_size))
+            for i in range(sample_num_rounded):
+                self.sample_z.append(np.random.uniform(-1, 1, size=(self.batch_size, 1, 1, self.z_dim)))
 
         # saver to save model
         self.saver = tf.compat.v1.train.Saver()
