@@ -35,11 +35,11 @@ class SAGAN(object):
 
 
         self.sample_num = kwargs.get('sample_num', 64)  # number of generated images to be saved
-        self.test_num = kwargs.get('test_num', 10)
+        self.test_num = kwargs.get('test_num', 1)
 
         """ Augmentation """
         self.crop_pos = kwargs.get('crop_pos', 'center')
-
+        self.zoom_range = kwargs.get('zoom_range', 0.0)
 
         # train
         self.g_learning_rate = kwargs.get('g_lr', 0.0001)
@@ -228,7 +228,7 @@ class SAGAN(object):
         """ Graph Input """
         # images
         if self.custom_dataset :
-            Image_Data_Class = ImageData(self.img_size, self.c_dim, crop_pos=self.crop_pos)
+            Image_Data_Class = ImageData(self.img_size, self.c_dim, crop_pos=self.crop_pos, zoom_range=self.zoom_range)
             inputs = tf.data.Dataset.from_tensor_slices(self.data)
             gpu_device = '/gpu:0'
             inputs = inputs.apply(shuffle_and_repeat(self.dataset_num)).apply(map_and_batch(Image_Data_Class.image_processing, self.batch_size, num_parallel_batches=16, drop_remainder=True)).apply(prefetch_to_device(gpu_device, self.batch_size))
@@ -287,41 +287,13 @@ class SAGAN(object):
     def train(self, z_noise=None):
 
         # initialize all variables
-        tf.compat.v1.global_variables_initializer().run()
+        tf.compat.v1.global_variables_initializer().run(session=self.sess)
 
         # graph inputs for visualize training results
-        self.sample_z = []
-        if type(z_noise) is np.ndarray:
-            if z_noise.shape[3] != self.z_dim:          # mismatch of z_dim
-                print(f'dimension of z_noise mismatch : {self.z_dim}')
-                return
-            else:
-                self.sample_num = z_noise.shape[0]
-                if self.sample_num == self.batch_size:
-                    self.sample_z.append(z_noise)
-                elif self.sample_num < self.batch_size:
-                    z_padding = np.random.uniform(-1, 1, size=(self.batch_size-self.sample_num, 1, 1, self.z_dim))
-                    z_extended = np.concatenate([z_noise, z_padding])
-                    self.sample_z.append(z_extended)
-                elif self.sample_num > self.batch_size:
-                    full_batch_num = self.sample_num // self.batch_size
-                    remaining = self.batch_size % self.sample_num
-                    for batch_num in range(full_batch_num):
-                        z_noise_per_batch = z_noise[self.batch_size*batch_num:self.batch_size*(batch_num+1)]
-                        self.sample_z.append(z_noise_per_batch)
-                    if remaining > 0:
-                        z_padding = np.random.uniform(-1, 1, size=(self.batch_size-remaining, 1, 1, self.z_dim))
-                        z_remaining = z_noise[batch_num+1:]
-                        z_extended = np.concatenate([z_remaining, z_padding])
-                        self.sample_z.append(z_extended)
-
-        else:
-            sample_num_rounded = int(np.ceil(self.sample_num/self.batch_size))
-            for i in range(sample_num_rounded):
-                self.sample_z.append(np.random.uniform(-1, 1, size=(self.batch_size, 1, 1, self.z_dim)))
+        sample_num, self.sample_z = self.get_z_samples(z_noise)
 
         # saver to save model
-        self.saver = tf.compat.v1.train.Saver()
+        self.saver = tf.compat.v1.train.Saver(max_to_keep=10)
 
         # summary writer
         self.writer = tf.compat.v1.summary.FileWriter(self.log_dir + '/' + self.model_dir, self.sess.graph)
@@ -345,7 +317,7 @@ class SAGAN(object):
         for epoch in range(start_epoch, self.epoch):
             # get batch data
             for idx in range(start_batch_id, self.iteration):
-                batch_z = np.random.uniform(-1, 1, [self.batch_size, 1, 1, self.z_dim])
+                batch_z = np.random.normal(0, 1, [self.batch_size, 1, 1, self.z_dim])
 
                 if self.custom_dataset :
 
@@ -381,7 +353,7 @@ class SAGAN(object):
                 print("Epoch: [%2d] [%5d/%5d] time: %4.4f, d_loss: %.8f, g_loss: %.8f" \
                       % (epoch, idx, self.iteration, time.time() - start_time, d_loss, g_loss))
 
-                # save training results for every 300 steps
+                # save training results for every n steps
                 if np.mod(idx+1, self.print_freq) == 0:
                     sample_list = []
                     for sample_z in self.sample_z:
@@ -391,13 +363,12 @@ class SAGAN(object):
                         samples = sample
                     else:
                         samples = np.concatenate(sample_list)
-                    # tot_num_samples = min(self.sample_num, self.batch_size)
-                    tot_num_samples = self.sample_num
+                    tot_num_samples = sample_num
                     manifold_h = int(np.floor(np.sqrt(tot_num_samples)))
                     manifold_w = int(np.floor(np.sqrt(tot_num_samples)))
-                    save_images(samples[:manifold_h * manifold_w, :, :, :],
+                    save_images_plt(samples[:manifold_h * manifold_w, :, :, :],
                                 [manifold_h, manifold_w],
-                                self.sample_dir + '/' + self.model_name + '_train_{:02d}_{:05d}.png'.format(epoch, idx+1))
+                                self.sample_dir + '/' + self.model_name + '_train_{:02d}_{:05d}.png'.format(epoch, idx+1), mode='sample')
 
                 if np.mod(idx+1, self.save_freq) == 0:
                     self.save(self.checkpoint_dir, counter)
@@ -484,43 +455,103 @@ class SAGAN(object):
         save_images(samples[:image_frame_dim * image_frame_dim, :, :, :], [image_frame_dim, image_frame_dim],
                     self.sample_dir + '/' + self.model_name + '_epoch%02d' % epoch + '_visualize.png')
 
-    def test(self):
-        tf.compat.v1.global_variables_initializer().run()
+    def get_z_samples(self, z_noise):
+        z_samples = []
+        if type(z_noise) is np.ndarray:
+            if z_noise.shape[3] != self.z_dim:          # mismatch of z_dim
+                print(f'dimension of z_noise mismatch : {self.z_dim}')
+                return None, None
+            else:
+                sample_num = z_noise.shape[0]
+                if sample_num == self.batch_size:
+                    z_samples.append(z_noise)
+                elif sample_num < self.batch_size:
+                    z_padding = np.random.uniform(-1, 1, size=(self.batch_size-sample_num, 1, 1, self.z_dim))
+                    z_extended = np.concatenate([z_noise, z_padding])
+                    z_samples.append(z_extended)
+                elif sample_num > self.batch_size:
+                    full_batch_num = sample_num // self.batch_size
+                    remaining = sample_num % self.batch_size
+                    for batch_num in range(full_batch_num):
+                        z_noise_per_batch = z_noise[self.batch_size*batch_num:self.batch_size*(batch_num+1)]
+                        z_samples.append(z_noise_per_batch)
+                    if remaining > 0:
+                        z_padding = np.random.uniform(-1, 1, size=(self.batch_size-remaining, 1, 1, self.z_dim))
+                        z_remaining = z_noise[self.batch_size*(batch_num+1):]
+                        z_extended = np.concatenate([z_remaining, z_padding])
+                        z_samples.append(z_extended)
+        else:
+            sample_num = self.sample_num
+            sample_num_rounded = int(np.ceil(sample_num/self.batch_size))
+            for i in range(sample_num_rounded):
+                z_samples.append(np.random.normal(0, 1, size=(self.batch_size, 1, 1, self.z_dim)))
+        return sample_num, z_samples
 
+    def load_pretrained_model(self):
+        tf.compat.v1.global_variables_initializer().run(session=self.sess)
         self.saver = tf.compat.v1.train.Saver()
         could_load, checkpoint_counter = self.load_models(self.checkpoint_dir)
-        result_dir = os.path.join(self.result_dir, self.model_dir)
-        check_folder(result_dir)
-
         if could_load:
             print(" [*] Load SUCCESS")
         else:
             print(" [!] Load failed...")
 
-        tot_num_samples = min(self.sample_num, self.batch_size)
-        image_frame_dim = int(np.floor(np.sqrt(tot_num_samples)))
+    def generate_single_images(self, name='result', z_noise=None):
+        if type(z_noise) is not np.ndarray:
+            print('no z_noise provided')
+            return
+        result_dir = os.path.join(self.result_dir, self.model_dir)
+        result_dir += f'/{name}'
+        check_folder(result_dir)
 
-        """ random condition, random noise """
+        samples= self.predict(z_noise)
+        print(samples.shape)
 
-        for i in range(self.test_num) :
-            sample_num_rounded = int(np.ceil(self.sample_num/self.batch_size))
-            z_samples = []
-            for j in range(sample_num_rounded):
-                z_samples.append(np.random.uniform(-1, 1, size=(self.batch_size, 1, 1, self.z_dim)))
+        for i in range(samples.shape[0]):
+            img = samples[i]
+            save_path = f'{result_dir}/{i:06d}.png'
+            save_image(img, save_path)
 
-            sample_list = []
-            for z_sample in z_samples:
-                sample = self.sess.run(self.fake_images, feed_dict={self.z: z_sample})
-                sample_list.append(sample)
-            if len(sample_list) == 1:
-                samples = sample
-            else:
-                samples = np.concatenate(sample_list)
 
-            tot_num_samples = self.sample_num
-            manifold_h = int(np.floor(np.sqrt(tot_num_samples)))
-            manifold_w = int(np.floor(np.sqrt(tot_num_samples)))
+    def predict(self, z_noise):
+        sample_num, z_samples = self.get_z_samples(z_noise)
 
-            save_images(samples[:manifold_h * manifold_h, :, :, :],
-                        [manifold_h, manifold_h],
-                        result_dir + '/' + self.model_name + '_test_{}.png'.format(i))
+        sample_list = []
+        for z_sample in z_samples:
+            sample = self.sess.run(self.fake_images, feed_dict={self.z: z_sample})
+            sample_list.append(sample)
+        if len(sample_list) == 1:
+            samples = sample
+        else:
+            samples = np.concatenate(sample_list)
+
+        samples = samples[:sample_num]
+
+        return samples
+
+
+    def test(self, name='test', nrows=None, ncols=None, z_noise=None):
+        # tf.compat.v1.global_variables_initializer().run(session=self.sess)
+        # self.saver = tf.compat.v1.train.Saver()
+        # could_load, checkpoint_counter = self.load_models(self.checkpoint_dir)
+        result_dir = os.path.join(self.result_dir, self.model_dir)
+        check_folder(result_dir)
+
+        if type(z_noise) is not np.ndarray:
+            sample_num = self.sample_num
+        else:
+            sample_num = z_noise[0]
+
+        result = self.predict(z_noise)
+
+
+        if nrows == None or ncols == None:
+            manifold_h = int(np.floor(np.sqrt(sample_num)))
+            manifold_w = int(np.floor(np.sqrt(sample_num)))
+        else:
+            manifold_h = nrows
+            manifold_w = ncols
+
+        save_images_plt(result,
+                    [manifold_w, manifold_h],
+                    result_dir + '/' + self.model_name + '_{}.png'.format(name))
