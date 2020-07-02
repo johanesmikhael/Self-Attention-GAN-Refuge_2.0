@@ -495,6 +495,7 @@ class SAGAN(object):
             print(" [*] Load SUCCESS")
         else:
             print(" [!] Load failed...")
+        return checkpoint_counter
 
     def generate_single_images(self, name='result', z_noise=None):
         if type(z_noise) is not np.ndarray:
